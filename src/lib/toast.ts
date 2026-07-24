@@ -10,24 +10,114 @@ function esc(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+interface ToastItem {
+  id: number;
+  el: HTMLElement;
+  duration: number;
+  startTime: number;
+  timerId?: ReturnType<typeof setTimeout>;
+}
+
 let _toastId = 0;
-const _toastTimers: Record<number, ReturnType<typeof setTimeout>> = {};
-const _toasts: { id: number; el: HTMLElement }[] = [];
+const _toasts: ToastItem[] = [];
+let _isExpanded = false;
+let _toasterEventsAttached = false;
+let _expandTimer: ReturnType<typeof setTimeout>;
+
+function _pauseTimers() {
+  _toasts.forEach(t => {
+    if (t.timerId) {
+      clearTimeout(t.timerId);
+      t.timerId = undefined;
+    }
+  });
+}
+
+function _resumeTimers() {
+  const now = Date.now();
+  _toasts.forEach(t => {
+    if (t.duration > 0 && !t.timerId) {
+      t.startTime = now;
+      t.timerId = setTimeout(() => _dismissToast(t.id), t.duration);
+    }
+  });
+}
+
+function _initToasterEvents() {
+  if (_toasterEventsAttached) return;
+  const toaster = document.getElementById("awp-toaster");
+  if (!toaster) return;
+  _toasterEventsAttached = true;
+
+  toaster.addEventListener("mouseenter", () => {
+    clearTimeout(_expandTimer);
+    if (!_isExpanded) {
+      _isExpanded = true;
+      toaster.dataset.expanded = "true";
+      toaster.dataset.lifted = "true";
+      _pauseTimers();
+      _updateToasts();
+    }
+  });
+
+  toaster.addEventListener("mousemove", () => {
+    clearTimeout(_expandTimer);
+    if (!_isExpanded) {
+      _isExpanded = true;
+      toaster.dataset.expanded = "true";
+      toaster.dataset.lifted = "true";
+      _pauseTimers();
+      _updateToasts();
+    }
+  });
+
+  toaster.addEventListener("mouseleave", () => {
+    clearTimeout(_expandTimer);
+    _expandTimer = setTimeout(() => {
+      _isExpanded = false;
+      toaster.dataset.expanded = "false";
+      toaster.dataset.lifted = "false";
+      _resumeTimers();
+      _updateToasts();
+    }, 150);
+  });
+}
 
 function _updateToasts() {
+  _initToasterEvents();
   const toaster = document.getElementById("awp-toaster");
   if (!toaster) return;
   const total = _toasts.length;
+  
+  if (total === 0) {
+    toaster.style.setProperty("--front-toast-height", "0px");
+    return;
+  }
+
+  let cumulativeOffset = 0;
+  const gap = 14;
+
   _toasts.forEach(({ el }, i) => {
-    el.dataset.front = (i === 0).toString();
+    const isFront = i === 0;
+    el.dataset.front = isFront.toString();
+    el.dataset.expanded = _isExpanded.toString();
     el.style.setProperty("--toasts-before", String(i));
     el.style.setProperty("--z-index", String(total - i));
+
+    const height = el.getBoundingClientRect().height || 56;
+    el.style.setProperty("--initial-height", `${height}px`);
+
+    if (_isExpanded) {
+      el.style.setProperty("--offset", String(cumulativeOffset));
+      cumulativeOffset += height + gap;
+    }
   });
-  if (_toasts.length > 0) {
+
+  if (_isExpanded && _toasts.length > 0) {
+    toaster.style.setProperty("--front-toast-height", `${cumulativeOffset}px`);
+  } else if (_toasts.length > 0) {
     const h = _toasts[0].el.getBoundingClientRect().height;
-    if (h > 0) toaster.style.setProperty("--front-toast-height", h + "px");
-  } else {
-    toaster.style.setProperty("--front-toast-height", "0px");
+    toaster.style.setProperty("--front-toast-height", (h || 56) + "px");
   }
 }
 
@@ -43,6 +133,7 @@ function _showToast(type: string, msg: string | { title: string }, opts: { durat
   el.dataset.mounted = "false";
   el.dataset.removed = "false";
   el.dataset.front = "true";
+  el.dataset.expanded = _isExpanded.toString();
 
   const icon = type === "message" ? "" : (TOAST_ICONS[type] || "");
   const title = typeof msg === "string" ? msg : (msg?.title || "");
@@ -56,13 +147,19 @@ function _showToast(type: string, msg: string | { title: string }, opts: { durat
     </div>
   `;
 
+  const item: ToastItem = {
+    id,
+    el,
+    duration,
+    startTime: Date.now()
+  };
+
   toaster.insertBefore(el, toaster.firstChild);
-  _toasts.unshift({ id, el });
+  _toasts.unshift(item);
 
   while (_toasts.length > 3) {
     const old = _toasts.pop()!;
-    clearTimeout(_toastTimers[old.id]);
-    delete _toastTimers[old.id];
+    if (old.timerId) clearTimeout(old.timerId);
     old.el.dataset.removed = "true";
     old.el.dataset.front = "false";
     const deadEl = old.el;
@@ -78,27 +175,25 @@ function _showToast(type: string, msg: string | { title: string }, opts: { durat
     })
   );
 
-  if (duration > 0) {
-    _toastTimers[id] = setTimeout(() => _dismissToast(id), duration);
+  if (duration > 0 && !_isExpanded) {
+    item.timerId = setTimeout(() => _dismissToast(id), duration);
   }
   return id;
 }
 
 function _dismissToast(id: number) {
-  clearTimeout(_toastTimers[id]);
-  delete _toastTimers[id];
   const idx = _toasts.findIndex((t) => t.id === id);
   if (idx === -1) return;
-  const { el } = _toasts[idx];
+  const t = _toasts[idx];
+  if (t.timerId) clearTimeout(t.timerId);
+  const { el } = t;
 
   if (idx === 0) {
-    // Front toast: original behavior unchanged
     el.dataset.removed = "true";
     _toasts.splice(idx, 1);
     _updateToasts();
-    setTimeout(() => el.remove(), 500);
+    setTimeout(() => el.remove(), 400);
   } else {
-    // Stacked toast: fade out in place, only reposition after it's gone
     el.style.transition = "opacity 300ms ease";
     el.style.opacity = "0";
     setTimeout(() => {
